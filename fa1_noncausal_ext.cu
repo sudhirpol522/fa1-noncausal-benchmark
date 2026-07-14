@@ -12,6 +12,7 @@
 #include <limits>
 
 #include "fa1-non-causal-alternate-implemetation.cu"
+#include "fa1_noncausal_v2.cu"
 
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 #define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
@@ -58,7 +59,43 @@ torch::Tensor fa1_noncausal_forward(torch::Tensor Q, torch::Tensor K, torch::Ten
     return O;
 }
 
+// Optimized kernel: one block per (batch, head, Q-tile), O written once,
+// no global l/m scratch tensors needed.
+torch::Tensor fa1_noncausal_v2_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
+    CHECK_CUDA(Q); CHECK_CUDA(K); CHECK_CUDA(V);
+    CHECK_F32(Q);  CHECK_F32(K);  CHECK_F32(V);
+    Q = Q.contiguous(); K = K.contiguous(); V = V.contiguous();
+
+    constexpr int Br = 32, Bc = 32;
+    int B  = Q.size(0);
+    int nh = Q.size(1);
+    int N  = Q.size(2);
+    int d  = Q.size(3);
+    int Tr = CEIL_DIV(N, Br);
+    int Tc = CEIL_DIV(N, Bc);
+
+    auto O = torch::empty_like(Q);
+    float scale = 1.0f / std::sqrt((float)d);
+
+    // Qi + Oi (Br*d each) + padded Kj (Bc*(d+1)) + Vj (Bc*d) + Sij (Br*Bc)
+    size_t smem = (size_t)(2 * Br * d + Bc * (d + 1) + Bc * d + Br * Bc) * sizeof(float);
+    if (smem > 48 * 1024) {
+        cudaFuncSetAttribute(flash_attn_v2_kernel<Br, Bc>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    }
+
+    dim3 grid(Tr, nh, B);
+    dim3 block(Br * Bc);
+    flash_attn_v2_kernel<Br, Bc><<<grid, block, smem>>>(
+        Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(),
+        N, d, Tc, scale, O.data_ptr<float>());
+
+    return O;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, mod) {
     mod.def("fa1_noncausal_forward", &fa1_noncausal_forward,
             "Non-causal Flash Attention v1 forward (fp32)");
+    mod.def("fa1_noncausal_v2_forward", &fa1_noncausal_v2_forward,
+            "Non-causal Flash Attention forward, optimized (fp32)");
 }

@@ -50,14 +50,22 @@ def make_qkv(B, H, N, d, device):
     return q, k, v
 
 
+KERNELS = {
+    "v1": lambda q, k, v: ext.fa1_noncausal_forward(q, k, v),
+    "v2": lambda q, k, v: ext.fa1_noncausal_v2_forward(q, k, v),
+}
+
+
 @torch.no_grad()
 def check_correctness(B, H, N, d, device):
     q, k, v = make_qkv(B, H, N, d, device)
     ref = F.scaled_dot_product_attention(q, k, v, is_causal=False)
-    out = ext.fa1_noncausal_forward(q, k, v)
-    err = (ref - out).abs().max().item()
-    ok = err < 5e-2  # fp32 flash vs SDPA tolerance
-    print(f"[N={N:>5}] max|Δ| = {err:.3e}  ->  {'PASS' if ok else 'FAIL'}")
+    ok = True
+    for name, fn in KERNELS.items():
+        err = (ref - fn(q, k, v)).abs().max().item()
+        this_ok = err < 5e-2  # fp32 flash vs SDPA tolerance
+        ok = ok and this_ok
+        print(f"[N={N:>5}] {name}: max|Δ| = {err:.3e}  ->  {'PASS' if this_ok else 'FAIL'}")
     return ok
 
 
@@ -81,22 +89,25 @@ def main():
         all_ok = check_correctness(B, H, N, d, device) and all_ok
     print("RESULT:", "PASS" if all_ok else "FAIL (inspect kernel before trusting timings)")
 
-    print("\n== Latency: torch SDPA vs custom FA1 (non-causal) ==")
-    print(f"{'N':>6} | {'torch (ms)':>12} | {'cuda (ms)':>12} | {'speedup':>8}")
-    print("-" * 48)
+    print("\n== Latency: torch SDPA vs custom kernels (non-causal) ==")
+    print(f"{'N':>6} | {'torch (ms)':>10} | {'v1 (ms)':>10} | {'v2 (ms)':>10} | "
+          f"{'v1/torch':>8} | {'v2/torch':>8} | {'v2 vs v1':>8}")
+    print("-" * 78)
     for N in args.seq_lens:
         q, k, v = make_qkv(B, H, N, d, device)
 
         with torch.no_grad():
             t_torch = cuda_time(lambda: F.scaled_dot_product_attention(q, k, v, is_causal=False),
                                 iters=args.iters, warmup=args.warmup)
-            t_cuda = cuda_time(lambda: ext.fa1_noncausal_forward(q, k, v),
-                               iters=args.iters, warmup=args.warmup)
+            t_v1 = cuda_time(lambda: KERNELS["v1"](q, k, v),
+                             iters=args.iters, warmup=args.warmup)
+            t_v2 = cuda_time(lambda: KERNELS["v2"](q, k, v),
+                             iters=args.iters, warmup=args.warmup)
 
-        speedup = t_torch / t_cuda
-        print(f"{N:>6} | {t_torch:12.4f} | {t_cuda:12.4f} | {speedup:7.2f}x")
+        print(f"{N:>6} | {t_torch:10.4f} | {t_v1:10.4f} | {t_v2:10.4f} | "
+              f"{t_torch / t_v1:7.2f}x | {t_torch / t_v2:7.2f}x | {t_v1 / t_v2:7.2f}x")
 
-    print("\n(speedup = torch_ms / cuda_ms; > 1x means the custom kernel is faster)")
+    print("\n(x/torch = torch_ms / kernel_ms; > 1x means the kernel is faster than SDPA)")
 
 
 if __name__ == "__main__":
